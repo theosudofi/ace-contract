@@ -1,0 +1,19 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.30"
+optimizer = true
+optimizer_runs = 10000
+via_ir = true
+evm_version = "cancun"
+
+[rpc_endpoints]
+robinhood = "${RH_RPC_URL}"
+robinhood_testnet = "${RH_TESTNET_RPC_URL}"
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
