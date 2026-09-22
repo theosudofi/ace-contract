@@ -2,10 +2,10 @@
 pragma solidity ^0.8.30;
 
 import { Ownable2Step } from "../access/Ownable2Step.sol";
-import { IPriceAdapter } from "../interfaces/IPriceAdapter.sol";
+import { IPriceAdapter, IUpdatablePriceAdapter, PriceData } from "../interfaces/IPriceAdapter.sol";
 import { MathX } from "../libraries/MathX.sol";
 
-/// @notice Asset-to-adapter registry with optional cross-oracle validation and fallback.
+/// @notice Oracle quorum, timestamp binding, market-status and circuit-breaker boundary.
 contract OracleRouter is Ownable2Step {
     enum Mode {
         PrimaryOnly,
@@ -17,17 +17,23 @@ contract OracleRouter is Ownable2Step {
         address primary;
         address secondary;
         uint16 maxDeviationBps;
+        uint16 maxHistoricalDeviationBps;
+        uint32 historicalDeviationWindow;
         Mode mode;
         bool enabled;
+        bool requireMarketOpen;
     }
-
     error InvalidOracleConfig();
     error AssetDisabled(bytes32 assetId);
     error NoValidPrice(bytes32 assetId);
     error PriceDeviation(bytes32 assetId, uint256 primaryPrice, uint256 secondaryPrice);
-
-    mapping(bytes32 assetId => AssetConfig) public configs;
-
+    error HistoricalDeviation(bytes32 assetId, uint256 oldPrice, uint256 newPrice);
+    error PricePredatesOrder();
+    error MarketClosed();
+    error InvalidUpdateTarget();
+    mapping(bytes32 => AssetConfig) public configs;
+    mapping(bytes32 => uint256) public lastAcceptedMid;
+    mapping(bytes32 => uint256) public lastAcceptedAt;
     event AssetConfigured(
         bytes32 indexed assetId,
         address indexed primary,
@@ -36,77 +42,94 @@ contract OracleRouter is Ownable2Step {
         uint16 maxDeviationBps,
         bool enabled
     );
-
+    event PriceAccepted(
+        bytes32 indexed assetId, uint256 minPrice, uint256 maxPrice, uint256 updatedAt
+    );
     constructor(address initialOwner) Ownable2Step(initialOwner) { }
 
-    function setAssetConfig(bytes32 assetId, AssetConfig calldata config) external onlyOwner {
+    function setAssetConfig(bytes32 assetId, AssetConfig calldata c) external onlyOwner {
         if (
-            assetId == bytes32(0) || config.primary == address(0) || config.primary.code.length == 0
-                || config.maxDeviationBps > 5_000
-                || (config.mode != Mode.PrimaryOnly
-                    && (config.secondary == address(0) || config.secondary.code.length == 0))
+            assetId == 0 || c.primary == address(0) || c.primary.code.length == 0
+                || c.maxDeviationBps > 5_000 || c.maxHistoricalDeviationBps > 10_000
+                || (c.mode != Mode.PrimaryOnly
+                    && (c.secondary == address(0) || c.secondary.code.length == 0))
         ) revert InvalidOracleConfig();
-        configs[assetId] = config;
-        emit AssetConfigured(
-            assetId,
-            config.primary,
-            config.secondary,
-            config.mode,
-            config.maxDeviationBps,
-            config.enabled
-        );
+        configs[assetId] = c;
+        emit AssetConfigured(assetId, c.primary, c.secondary, c.mode, c.maxDeviationBps, c.enabled);
     }
 
-    /// @return priceWad USD price normalized to 18 decimals.
-    function getPrice(bytes32 assetId, uint256 maxAge)
+    function updatePrice(bytes32 assetId, bool secondary, bytes calldata data) external payable {
+        AssetConfig memory c = configs[assetId];
+        address target = secondary ? c.secondary : c.primary;
+        if (!c.enabled || target == address(0)) revert InvalidUpdateTarget();
+        IUpdatablePriceAdapter(target).update{ value: msg.value }(data);
+    }
+
+    function getPrice(bytes32 assetId, uint256 maxAge) external view returns (PriceData memory) {
+        return _read(assetId, maxAge);
+    }
+
+    function getPriceForAction(bytes32 assetId, uint256 maxAge, uint256 submittedAt)
         external
-        view
-        returns (uint256 priceWad, uint256 updatedAt)
+        returns (PriceData memory data)
     {
-        AssetConfig memory config = configs[assetId];
-        if (!config.enabled) revert AssetDisabled(assetId);
-
-        (bool primaryOk, uint256 primaryPrice, uint256 primaryTime) =
-            _tryRead(config.primary, maxAge);
-        if (config.mode == Mode.PrimaryOnly) {
-            if (!primaryOk) revert NoValidPrice(assetId);
-            return (primaryPrice, primaryTime);
+        AssetConfig memory c = configs[assetId];
+        data = _read(assetId, maxAge);
+        if (data.updatedAt < submittedAt) revert PricePredatesOrder();
+        if (c.requireMarketOpen && !data.marketOpen) revert MarketClosed();
+        uint256 mid = (data.minPrice + data.maxPrice) / 2;
+        uint256 old = lastAcceptedMid[assetId];
+        if (
+            old != 0 && c.maxHistoricalDeviationBps != 0
+                && block.timestamp <= lastAcceptedAt[assetId] + c.historicalDeviationWindow
+        ) {
+            uint256 diff = mid > old ? mid - old : old - mid;
+            if (MathX.mulDiv(diff, 10_000, old) > c.maxHistoricalDeviationBps) {
+                revert HistoricalDeviation(assetId, old, mid);
+            }
         }
+        lastAcceptedMid[assetId] = mid;
+        lastAcceptedAt[assetId] = block.timestamp;
+        emit PriceAccepted(assetId, data.minPrice, data.maxPrice, data.updatedAt);
+    }
 
-        (bool secondaryOk, uint256 secondaryPrice, uint256 secondaryTime) =
-            _tryRead(config.secondary, maxAge);
-        if (config.mode == Mode.RequireBoth && (!primaryOk || !secondaryOk)) {
+    function _read(bytes32 assetId, uint256 maxAge) private view returns (PriceData memory) {
+        AssetConfig memory c = configs[assetId];
+        if (!c.enabled) revert AssetDisabled(assetId);
+        (bool pOk, PriceData memory p) = _tryRead(c.primary, maxAge);
+        if (c.mode == Mode.PrimaryOnly) {
+            if (!pOk) revert NoValidPrice(assetId);
+            return p;
+        }
+        (bool sOk, PriceData memory s) = _tryRead(c.secondary, maxAge);
+        if ((c.mode == Mode.RequireBoth && (!pOk || !sOk)) || (!pOk && !sOk)) {
             revert NoValidPrice(assetId);
         }
-        if (!primaryOk && !secondaryOk) revert NoValidPrice(assetId);
-        if (!primaryOk) return (secondaryPrice, secondaryTime);
-        if (!secondaryOk) return (primaryPrice, primaryTime);
-
-        uint256 difference = primaryPrice > secondaryPrice
-            ? primaryPrice - secondaryPrice
-            : secondaryPrice - primaryPrice;
-        uint256 deviationBps = MathX.mulDiv(difference, 10_000, primaryPrice);
-        if (deviationBps > config.maxDeviationBps) {
-            revert PriceDeviation(assetId, primaryPrice, secondaryPrice);
+        if (!pOk) return s;
+        if (!sOk) return p;
+        uint256 pm = (p.minPrice + p.maxPrice) / 2;
+        uint256 sm = (s.minPrice + s.maxPrice) / 2;
+        uint256 diff = pm > sm ? pm - sm : sm - pm;
+        if (MathX.mulDiv(diff, 10_000, pm) > c.maxDeviationBps) {
+            revert PriceDeviation(assetId, pm, sm);
         }
-
-        // The configured primary remains authoritative; the secondary is a circuit breaker.
-        return (primaryPrice, primaryTime < secondaryTime ? primaryTime : secondaryTime);
+        p.updatedAt = p.updatedAt < s.updatedAt ? p.updatedAt : s.updatedAt;
+        p.marketOpen = p.marketOpen && s.marketOpen;
+        return p;
     }
 
     function _tryRead(address adapter, uint256 maxAge)
         private
         view
-        returns (bool ok, uint256 price, uint256 timestamp)
+        returns (bool ok, PriceData memory data)
     {
-        try IPriceAdapter(adapter).getPrice(maxAge) returns (uint256 p, uint256 t) {
+        try IPriceAdapter(adapter).getPrice(maxAge) returns (PriceData memory d) {
             if (
-                p != 0 && p <= uint256(type(int256).max) && t != 0 && t <= block.timestamp
-                    && block.timestamp - t <= maxAge
-            ) {
-                return (true, p, t);
-            }
+                d.minPrice != 0 && d.minPrice <= d.maxPrice
+                    && d.maxPrice <= uint256(type(int256).max) && d.updatedAt != 0
+                    && d.updatedAt <= block.timestamp && block.timestamp - d.updatedAt <= maxAge
+            ) return (true, d);
         } catch { }
-        return (false, 0, 0);
+        return (false, data);
     }
 }

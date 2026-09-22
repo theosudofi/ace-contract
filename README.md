@@ -9,13 +9,19 @@ first EVM release.
 
 ## What is included
 
-- isolated-margin perpetual positions with partial and full close;
-- permissionless liquidation, skew-based funding, trading fees, and pool solvency checks;
-- LP deposits and withdrawals with an open-interest reserve requirement;
+- isolated per-market, per-side vaults with transferable ERC-20 LP shares;
+- position increase, collateral add/withdraw, partial/full close, minimum remainder, and liquidation;
+- utilization-based borrowing, trading fees, and independently routed treasury, insurance, keeper,
+  and LP fee shares;
+- marked-to-market LP pricing over pool assets, aggregate pending position PnL, and pending LP
+  borrowing fees;
 - a path-integrated price-impact model that penalizes skew-increasing trades and gives bounded
   rebates to skew-reducing trades;
-- a configurable oracle router with staleness checks, failover, and cross-source deviation limits;
-- Chainlink Data Feed, Pyth, and Stork adapters;
+- escrowed limit, stop-loss, and take-profit orders with expiry, cancellation, and native execution
+  fees;
+- an oracle router with bid/ask prices, action-specific age limits, order timestamp binding,
+  market status, failover, cross-source checks, and a historical-deviation circuit breaker;
+- Chainlink Data Feed and verified Data Streams adapters plus same-transaction Pyth/Stork updates;
 - two-step ownership, a separate pause guardian, and close/liquidate availability while paused.
 
 ## Deliberately removed from the first EVM core
@@ -50,13 +56,30 @@ the unsafe arbitrary fixed-point exponentiation found in the Move implementation
 - primary-only reads;
 - primary reads with automatic fallback;
 - both-sources-required reads;
-- maximum price age and maximum cross-source deviation.
+- maximum price age and maximum cross-source deviation;
+- conservative min/max prices (bid/ask or Pyth confidence bounds);
+- a requirement that an execution price was published no earlier than its order submission;
+- RWA market-open status and L2 sequencer availability checks in adapters;
+- a historical price-deviation breaker with a configurable cooldown window.
 
-Chainlink is intended as the primary Robinhood Chain path. Pyth uses `getPriceNoOlderThan` and
-checks its confidence interval. Stork consumes the `getTemporalNumericValueV1` 1e18-quantized
-value. Pyth and Stork contracts/feeds must exist on the target network before their adapters can be
-enabled. Chainlink Data Streams are not treated as ordinary Data Feeds; a future Streams adapter
-should verify reports through Robinhood Chain's verifier proxy before exposing a price.
+Chainlink is intended as the primary Robinhood Chain path. `ChainlinkDataStreamAdapter` submits the
+signed payload to the configured verifier and stores only the verified feed's bid/ask report. Pyth
+uses price ± confidence and Stork uses its 1e18-quantized value; both adapters accept update
+payloads in the same transaction as order execution. Addresses, report schema, feed decimals, and
+fees must be checked against the live provider deployment before production configuration.
+
+## Isolated pool accounting
+
+Each market deploys independent long and short `MarketPoolToken` vaults. Trader collateral for a
+side and that side's LP liquidity are held in the same vault but tracked separately. Its LP NAV is:
+
+```text
+vault assets - open-position collateral - aggregate trader PnL + pending LP borrowing fees
+```
+
+Aggregate size tokens preserve entry-price exposure without iterating positions. A profitable
+trader liability lowers the LP token price immediately; a loss or accrued LP borrowing fee raises
+it. One market or side cannot withdraw another market's assets.
 
 ## Build and test
 
@@ -67,8 +90,9 @@ forge build
 forge test --offline
 ```
 
-The suite covers price-impact path independence, skew rebates, stale and diverging oracle sources,
-fallback behavior, profitable close, funding, pause behavior, liquidity reserves, and liquidation.
+The suite covers isolated vaults, transferable shares, marked-to-market NAV, borrowing, position
+changes, minimum partial-close size, orders, price-impact path independence, oracle timestamp and
+market-status rules, sequencer checks, Data Streams verification, and Pyth/Stork updates.
 
 ## Robinhood Chain
 
@@ -98,10 +122,13 @@ the underlying venue is open.
 
 ## Main contracts
 
-- `src/AcePerp.sol` — positions, liquidity, PnL, fees, funding, and liquidation.
+- `src/AcePerp.sol` — isolated vault accounting, positions, PnL, borrowing, fees, and liquidation.
+- `src/AceOrderManager.sol` — conditional-order escrow, expiry, cancellation, and keeper payment.
+- `src/market/MarketPoolToken.sol` — transferable LP share and isolated side vault.
 - `src/libraries/PriceImpactModel.sol` — execution-price model.
 - `src/oracles/OracleRouter.sol` — source selection and circuit breaking.
 - `src/oracles/ChainlinkAdapter.sol` — Chainlink Data Feeds.
+- `src/oracles/ChainlinkDataStreamAdapter.sol` — verified signed bid/ask reports.
 - `src/oracles/PythAdapter.sol` and `src/oracles/StorkAdapter.sol` — retained integrations.
 
 See [SECURITY.md](SECURITY.md) for assumptions and pre-production work.

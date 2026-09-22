@@ -37,16 +37,23 @@ contract Deploy {
 
         vm.startBroadcast(privateKey);
         router = new OracleRouter(deployer);
-        collateralAdapter = new ChainlinkAdapter(vm.envAddress("COLLATERAL_CHAINLINK_FEED"));
-        indexAdapter = new ChainlinkAdapter(vm.envAddress("INDEX_CHAINLINK_FEED"));
+        collateralAdapter = new ChainlinkAdapter(
+            vm.envAddress("COLLATERAL_CHAINLINK_FEED"), address(0), 0, address(0), true
+        );
+        indexAdapter = new ChainlinkAdapter(
+            vm.envAddress("INDEX_CHAINLINK_FEED"), address(0), 0, address(0), true
+        );
         router.setAssetConfig(
             collateralAssetId,
             OracleRouter.AssetConfig({
                 primary: address(collateralAdapter),
                 secondary: address(0),
                 maxDeviationBps: 0,
+                maxHistoricalDeviationBps: 2_000,
+                historicalDeviationWindow: 1 hours,
                 mode: OracleRouter.Mode.PrimaryOnly,
-                enabled: true
+                enabled: true,
+                requireMarketOpen: false
             })
         );
         router.setAssetConfig(
@@ -55,8 +62,11 @@ contract Deploy {
                 primary: address(indexAdapter),
                 secondary: address(0),
                 maxDeviationBps: 0,
+                maxHistoricalDeviationBps: 2_000,
+                historicalDeviationWindow: 1 hours,
                 mode: OracleRouter.Mode.PrimaryOnly,
-                enabled: true
+                enabled: true,
+                requireMarketOpen: true
             })
         );
         perp = new AcePerp(deployer, guardian, collateralToken, collateralAssetId, address(router));
