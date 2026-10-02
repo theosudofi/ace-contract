@@ -13,14 +13,15 @@ This repository is not audited. Its tests establish intended behavior, not produ
 
 ## Accounting assumptions
 
-- One ERC-20 token supplies LP liquidity and isolated trader margin, but custody, OI, PnL, and
-  reserves are isolated for every market side.
+- A pool accepts one or more ERC-20 tokens and issues one LP token. Several markets may share that
+  pool. A position is margined and settled in one of the pool's tokens. Payouts use that token, so
+  it must have enough free inventory even when another token supplies part of the USD reserve.
 - Fee-on-transfer, rebasing, callback, and tokens with more than 18 decimals are unsupported.
 - LP shares are marked to market using physical assets, aggregate pending position PnL, and the LP
   portion of pending borrowing fees. Conservative collateral and index bounds are used.
 - Bad debt is limited by isolated collateral but can still reduce LP assets during fast gaps.
-- Market OI caps, leverage, maintenance margin, borrowing factor, and side reserve factor must be
-  calibrated together using stress tests.
+- Market OI caps, leverage, maintenance margin, borrowing factor, and reserve factor must be
+  calibrated together using stress tests. Markets that share a pool also share its free liquidity.
 
 ## Oracle assumptions
 

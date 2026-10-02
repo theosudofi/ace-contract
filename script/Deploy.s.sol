@@ -1,75 +1,39 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
+import { AceOrderManager } from "../src/AceOrderManager.sol";
 import { AcePerp } from "../src/AcePerp.sol";
+import { PoolLogic } from "../src/PoolLogic.sol";
+import { TradeLogic } from "../src/TradeLogic.sol";
 import { OracleRouter } from "../src/oracles/OracleRouter.sol";
-import { ChainlinkAdapter } from "../src/oracles/ChainlinkAdapter.sol";
 
 interface VmScript {
     function envUint(string calldata name) external view returns (uint256);
     function envAddress(string calldata name) external view returns (address);
-    function envBytes32(string calldata name) external view returns (bytes32);
     function addr(uint256 privateKey) external view returns (address);
     function startBroadcast(uint256 privateKey) external;
     function stopBroadcast() external;
 }
 
-/// @notice Deploys the core and two Chainlink feed adapters. Markets are configured separately.
+/// @notice Deploys the oracle router, the core, and the order manager. Pools and markets come later.
 contract Deploy {
     VmScript private constant vm =
         VmScript(address(uint160(uint256(keccak256("hevm cheat code")))));
 
-    function run()
-        external
-        returns (
-            OracleRouter router,
-            AcePerp perp,
-            ChainlinkAdapter collateralAdapter,
-            ChainlinkAdapter indexAdapter
-        )
-    {
+    function run() external returns (OracleRouter router, AcePerp perp, AceOrderManager orders) {
         uint256 privateKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(privateKey);
         address guardian = vm.envAddress("GUARDIAN");
-        address collateralToken = vm.envAddress("COLLATERAL_TOKEN");
-        bytes32 collateralAssetId = vm.envBytes32("COLLATERAL_ASSET_ID");
-        bytes32 indexAssetId = vm.envBytes32("INDEX_ASSET_ID");
 
         vm.startBroadcast(privateKey);
         router = new OracleRouter(deployer);
-        collateralAdapter = new ChainlinkAdapter(
-            vm.envAddress("COLLATERAL_CHAINLINK_FEED"), address(0), 0, address(0), true
+        PoolLogic poolLogic = new PoolLogic();
+        TradeLogic tradeLogic = new TradeLogic();
+        perp = new AcePerp(
+            deployer, guardian, address(router), address(poolLogic), address(tradeLogic)
         );
-        indexAdapter = new ChainlinkAdapter(
-            vm.envAddress("INDEX_CHAINLINK_FEED"), address(0), 0, address(0), true
-        );
-        router.setAssetConfig(
-            collateralAssetId,
-            OracleRouter.AssetConfig({
-                primary: address(collateralAdapter),
-                secondary: address(0),
-                maxDeviationBps: 0,
-                maxHistoricalDeviationBps: 2_000,
-                historicalDeviationWindow: 1 hours,
-                mode: OracleRouter.Mode.PrimaryOnly,
-                enabled: true,
-                requireMarketOpen: false
-            })
-        );
-        router.setAssetConfig(
-            indexAssetId,
-            OracleRouter.AssetConfig({
-                primary: address(indexAdapter),
-                secondary: address(0),
-                maxDeviationBps: 0,
-                maxHistoricalDeviationBps: 2_000,
-                historicalDeviationWindow: 1 hours,
-                mode: OracleRouter.Mode.PrimaryOnly,
-                enabled: true,
-                requireMarketOpen: true
-            })
-        );
-        perp = new AcePerp(deployer, guardian, collateralToken, collateralAssetId, address(router));
+        orders = new AceOrderManager(deployer, address(perp), 0);
+        perp.setOrderManager(address(orders));
         vm.stopBroadcast();
     }
 }

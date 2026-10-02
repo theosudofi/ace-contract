@@ -1,42 +1,35 @@
-# Ace EVM
+# Ace
 
-Ace EVM is a compact Solidity redesign of the Sui Move `ace-contract` perpetuals protocol. It targets
-Robinhood Chain and deliberately avoids carrying Sui-specific or deprecated surface area into the
-first EVM release.
+Ace is a Solidity perpetuals protocol for Robinhood Chain. One shared LP pool holds a collateral
+set, and one or more perp markets trade against that pool.
 
 > **Status:** functional, tested prototype. It has not been independently audited and must not hold
 > production funds until it has completed protocol-specific economic testing and a security audit.
 
 ## What is included
 
-- isolated per-market, per-side vaults with transferable ERC-20 LP shares;
+- one shared LP pool per collateral set, with one or more perp markets on that pool;
 - position increase, collateral add/withdraw, partial/full close, minimum remainder, and liquidation;
-- utilization-based borrowing, trading fees, and independently routed treasury, insurance, keeper,
-  and LP fee shares;
-- marked-to-market LP pricing over pool assets, aggregate pending position PnL, and pending LP
-  borrowing fees;
+- a per-token vault reserving fee, plus funding either from open-interest skew or from LP PnL
+  including open mark-to-market, with trading fees routed to treasury, insurance, keeper, and LPs;
+- LP pricing over each token's cash, escrow, and unpaid reserving fee, plus unpaid funding.
+  Open trader PnL is settled from the position escrow and is not marked into the share price;
 - a path-integrated price-impact model that penalizes skew-increasing trades and gives bounded
   rebates to skew-reducing trades;
-- escrowed limit, stop-loss, and take-profit orders with expiry, cancellation, and native execution
-  fees;
+- market, limit, stop-loss, and take-profit orders. Opens and decreases are created first and
+  filled by a keeper. An empty keeper list is permissionless; a non-empty list is an allowlist;
+- target weights and a rebase fee on deposits, withdrawals, and collateral swaps. A withdrawal
+  pays only from that token's vault and cannot exceed that vault's value;
+- a loss-protection vault that can take a cut of trader losses and fund a share of wins;
+- a function mask and a `migrate` entrypoint that advances the version by one;
 - an oracle router with bid/ask prices, action-specific age limits, order timestamp binding,
   market status, failover, cross-source checks, and a historical-deviation circuit breaker;
 - Chainlink Data Feed and verified Data Streams adapters plus same-transaction Pyth/Stork updates;
 - two-step ownership, a separate pause guardian, and close/liquidate availability while paused.
 
-## Deliberately removed from the first EVM core
-
-The original Move repository contains deprecated entrypoints and several features coupled to Sui's
-object model. This version does not port the duplicated v1/v2/v3 functions, `SCARD`, referral
-storage, USDZ minting, delayed order variants, Move capability wrappers, dynamic object bags,
-multi-collateral swaps, or legacy valuation snapshots. Direct execution and one settlement token
-keep the accounting and audit surface small. These features should return only as separate modules
-with a demonstrated product need.
-
 ## Price impact
 
-The old model applies a spread from final-side utilization and then adds a reference-size
-multiplier. The new model assigns a bounded potential to absolute OI skew:
+Price impact is a bounded potential on absolute open-interest skew:
 
 ```text
 potential(skew) = maxOI * impactFactor * (min(|longOI-shortOI| / maxOI, 1) ^ exponent)
@@ -46,8 +39,7 @@ impactRate       = impactUSD / tradeSize
 
 Negative impact is a cost; positive impact is a rebate. Because execution uses the change in
 potential over the full OI path, splitting one order into smaller orders produces the same
-size-weighted impact (apart from integer rounding). Exponents are restricted to 1 or 2, eliminating
-the unsafe arbitrary fixed-point exponentiation found in the Move implementation.
+size-weighted impact (apart from integer rounding). Exponents are restricted to 1 or 2.
 
 ## Oracle model
 
@@ -70,16 +62,22 @@ fees must be checked against the live provider deployment before production conf
 
 ## Isolated pool accounting
 
-Each market deploys independent long and short `MarketPoolToken` vaults. Trader collateral for a
-side and that side's LP liquidity are held in the same vault but tracked separately. Its LP NAV is:
+Each pool lists the tokens it accepts and deploys one `MarketPoolToken`. Long and short are
+position directions, not separate vaults. Several markets can share that pool: an NVDA/USDG pool
+can margin both the NVDA perp and another perp, in either token. Trader margin is accounted on the position. LP coins escrowed for that position are accounted
+on the token vault. The LP price is:
 
 ```text
-vault assets - open-position collateral - aggregate trader PnL + pending LP borrowing fees
+sum of each token vault (LP cash + escrowed LP coins + unpaid reserving fee)
+  + unpaid funding
+Trader margin and open mark-to-market are outside this price. A withdrawal in one token
+cannot take more than that token's own vault value.
 ```
 
-Aggregate size tokens preserve entry-price exposure without iterating positions. A profitable
-trader liability lowers the LP token price immediately; a loss or accrued LP borrowing fee raises
-it. One market or side cannot withdraw another market's assets.
+Aggregate size tokens preserve entry-price exposure without iterating positions. Open profit
+does not move the LP price until it settles, and then only through the escrowed coins. A reserving
+fee accrues on each token's escrow. A pool cannot withdraw another pool's assets. Markets on the
+same pool share its LP token and its per-token vaults.
 
 ## Build and test
 
@@ -90,7 +88,8 @@ forge build
 forge test --offline
 ```
 
-The suite covers isolated vaults, transferable shares, marked-to-market NAV, borrowing, position
+The suite covers a shared pool, multiple markets, transferable shares, marked-to-market NAV,
+borrowing, funding, imbalance fees, collateral swaps, keeper execution, loss protection, position
 changes, minimum partial-close size, orders, price-impact path independence, oracle timestamp and
 market-status rules, sequencer checks, Data Streams verification, and Pyth/Stork updates.
 
@@ -114,21 +113,24 @@ forge script script/Deploy.s.sol:Deploy \
   --broadcast
 ```
 
-The deployment script registers Chainlink adapters for collateral and one index asset, then deploys
-the core. Create each market only after independently verifying the token, feed addresses,
-heartbeat, decimals, market hours, and risk parameters. For stock/RWA markets, operational logic
-must account for exchange closures and feed market status; a merely recent price is not proof that
-the underlying venue is open.
+The deployment script deploys `OracleRouter`, `AcePerp`, and `AceOrderManager`, then points the core
+at the order manager. Collateral tokens, oracle feeds,
+pools, and markets are configured afterward by the owner. Create a pool with the tokens it should
+accept, register a price for each of those asset ids, then attach one market. For an NVDA perp
+margined in NVDA or USDG, the pool lists both tokens and the market's index asset is NVDA. Verify
+token and feed addresses, heartbeat, decimals, market hours, and risk parameters first. For
+stock/RWA markets, operational logic must account for exchange closures and feed market status; a
+merely recent price is not proof that the underlying venue is open.
 
 ## Main contracts
 
-- `src/AcePerp.sol` — isolated vault accounting, positions, PnL, borrowing, fees, and liquidation.
-- `src/AceOrderManager.sol` — conditional-order escrow, expiry, cancellation, and keeper payment.
-- `src/market/MarketPoolToken.sol` — transferable LP share and isolated side vault.
+- `src/AcePerp.sol` — shared vault accounting, positions, PnL, borrowing, funding, fees, swaps, and liquidation.
+- `src/AceOrderManager.sol` — market and conditional orders, keeper allowlist, and native execution fees.
+- `src/market/MarketPoolToken.sol` — transferable LP share and shared pool vault.
 - `src/libraries/PriceImpactModel.sol` — execution-price model.
 - `src/oracles/OracleRouter.sol` — source selection and circuit breaking.
 - `src/oracles/ChainlinkAdapter.sol` — Chainlink Data Feeds.
 - `src/oracles/ChainlinkDataStreamAdapter.sol` — verified signed bid/ask reports.
-- `src/oracles/PythAdapter.sol` and `src/oracles/StorkAdapter.sol` — retained integrations.
+- `src/oracles/PythAdapter.sol` and `src/oracles/StorkAdapter.sol` — same-transaction price updates.
 
 See [SECURITY.md](SECURITY.md) for assumptions and pre-production work.

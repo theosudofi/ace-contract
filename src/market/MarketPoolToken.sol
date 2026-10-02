@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 import { SafeTransferLib } from "../libraries/SafeTransferLib.sol";
 
-/// @notice Transferable LP share token and isolated custody vault for one market side.
+/// @notice Transferable LP share token and shared custody vault for one pool.
 contract MarketPoolToken {
     using SafeTransferLib for address;
 
@@ -13,7 +13,6 @@ contract MarketPoolToken {
     string public name;
     string public symbol;
     uint8 public constant decimals = 18;
-    address public immutable asset;
     address public immutable controller;
     uint256 public totalSupply;
 
@@ -23,11 +22,10 @@ contract MarketPoolToken {
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event Approval(address indexed owner, address indexed spender, uint256 amount);
 
-    constructor(string memory name_, string memory symbol_, address asset_, address controller_) {
-        if (asset_ == address(0) || controller_ == address(0)) revert InvalidAddress();
+    constructor(string memory name_, string memory symbol_, address controller_) {
+        if (controller_ == address(0)) revert InvalidAddress();
         name = name_;
         symbol = symbol_;
-        asset = asset_;
         controller = controller_;
     }
 
@@ -66,8 +64,9 @@ contract MarketPoolToken {
         emit Transfer(from, address(0), amount);
     }
 
-    function transferAsset(address to, uint256 amount) external onlyController {
-        asset.safeTransfer(to, amount);
+    function transferToken(address token, address to, uint256 amount) external onlyController {
+        if (token == address(0) || to == address(0)) revert InvalidAddress();
+        token.safeTransfer(to, amount);
     }
 
     function _transfer(address from, address to, uint256 amount) private {
